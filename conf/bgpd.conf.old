@@ -1,0 +1,56 @@
+vrf definition CUST1
+  rd 65000:100
+  route-target import 65000:100
+  route-target export 65000:100
+  table 100
+!
+vrf definition BLUE
+  rd 65000:10
+  route-target import 65000:10
+  route-target export 65000:10
+  vni 10
+  bridge br-blue
+!
+vrf definition VPLS1
+  rd 65000:50
+  route-target import 65000:50
+  route-target export 65000:50
+  bridge br-vpls1
+!
+ip prefix-list PL-DEFAULT seq 10 permit 0.0.0.0/0 le 32
+route-map RM-IN permit 10
+  match ip address prefix-list PL-DEFAULT
+route-map RM-OUT permit 10
+!  set local-preference 200
+!
+router bgp 65000
+  bgp router-id 10.8.0.7
+  bgp cluster-id 10.0.0.7
+  neighbor 192.168.1.200 remote-as 65000
+  neighbor 192.168.1.200 route-map RM-IN in
+  neighbor 192.168.1.200 route-map RM-OUT out
+  address-family ipv4 unicast
+    network 192.0.2.0/24
+    neighbor 192.168.1.200 activate
+  exit-address-family
+  !
+  address-family ipv6 unicast
+    neighbor 192.168.1.200 activate
+  exit-address-family
+  !
+  address-family ipv4 vrf CUST1
+    network 10.10.0.0/24
+    neighbor 192.168.1.200 activate
+  exit-address-family
+  address-family ipv4 vrf BLUE
+    network 10.20.0.0/24
+    neighbor 192.168.1.200 activate
+  exit-address-family
+  !
+  !address-family l2vpn evpn
+  !    neighbor 192.168.1.200 activate
+  !exit-address-family
+  address-family l2vpn vpls
+   neighbor 192.168.1.200 activate
+  exit-address-family
+!
