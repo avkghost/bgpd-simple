@@ -220,6 +220,18 @@ void decision_on_update4(bgp_core_t* c, bgp_peer_t* from,
             if (!route_map_apply(&c->pol, dst->rmap_out, pfx, plen, &outa))
                 continue;
 
+            /* RFC 4271 §5.1.3: When advertising to eBGP peers,
+             * MUST change next-hop to self to ensure reachability via our router.
+             * For iBGP peers, next-hop is typically unchanged (unless crossing AS with MPLS).
+             */
+            if (to_ebgp && outa.has_next_hop) {
+                /* eBGP: Always set next-hop to self (router-id) unless explicitly overridden by policy */
+                outa.next_hop = c->router_id;
+            } else if (outa.set_next_hop_self && outa.has_next_hop) {
+                /* For iBGP or if policy explicitly requests it */
+                outa.next_hop = c->router_id;
+            }
+
             if (dst->send_update4)
                 dst->send_update4(dst, &pfx, plen, &outa, /*withdraw=*/false);
         }
