@@ -1,5 +1,3 @@
-<<<<<<< HEAD
-=======
 ##### Windows
 # Windows thumbnail cache files
 Thumbs.db
@@ -988,7 +986,6 @@ _deps
 *.bin
 
 ##### C
->>>>>>> 6695797 (Initial commit.)
 # Prerequisites
 *.d
 
@@ -1042,14 +1039,9 @@ Module.symvers
 Mkfile.old
 dkms.conf
 
-<<<<<<< HEAD
-# debug information files
-*.dwo
-=======
 # Raspberry Pi Pico Object file
 *.uf2
 # Raspberry Pi Pico disassembler file
 *.dis
 
 .idea/
->>>>>>> 6695797 (Initial commit.)

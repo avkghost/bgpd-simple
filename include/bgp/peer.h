@@ -67,6 +67,11 @@ typedef struct bgp_peer {
                       const bgp_attrs_t* a,
                       bool withdraw);
 
+  int (*send_update6)(struct bgp_peer* p,
+                      const struct in6_addr* pfx, uint8_t plen,
+                      const bgp_attrs_t* a,
+                      bool withdraw);
+
   void (*fsm_event)(struct bgp_peer*, int ev);
 
   // negotiated capabilities parsed from peer OPEN

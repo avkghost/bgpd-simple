@@ -4,6 +4,7 @@
 #include "bgp/log.h"
 #include "bgp/fsm.h"
 #include "bgp/update.h"
+#include "bgp/update6.h"
 #include "bgp/core.h"
 #include "bgp/peer.h"
 #include "bgp/mpbgp.h"
@@ -223,6 +224,9 @@ int bgp_send_open(bgp_peer_t* p){
   if(p->af_vpls_active)   param = add_cap_mp(param, 25, 65);
 
   param = add_cap_rr(param);
+  /* RFC 4893 Section 2: Always advertise 4-octet AS capability for interoperability
+   * This allows peers to properly handle 4-byte ASN paths and use 4-byte encoding
+   * when both sides support AS4. We advertise our local ASN (which may be 2 or 4 bytes). */
   param = add_cap_as4(param, p->local_asn);
   param = add_cap_gr(param, p->local_hold);
 
@@ -244,6 +248,7 @@ int bgp_send_open(bgp_peer_t* p){
   uint16_t tot = (uint16_t)(19 + sizeof(bgp_open_fixed_t) + opt_len);
   h->len = htons(tot);
 
+  /* RFC 4893: AS4 capability is always advertised now */
   log_msg(BGP_LOG_INFO,
           "TX OPEN local-as=%u id=%s caps: ipv4u=%d vpnv4=%d evpn=%d vpls=%d rr=1 as4=1 gr=1",
           p->local_asn, inet_ntoa(p->local_id),
@@ -298,6 +303,9 @@ int peer_send_update4(bgp_peer_t* p,
     u.nlri[0].plen = plen;
     u.nlri_count = 1;
   }
+
+  /* RFC 4893: Use 4-byte ASN encoding if peer advertised AS4 capability */
+  u.as4_capable = p->caps.as4;
 
   bool is_ibgp = (p->local_asn == p->remote_asn_cfg);
   int pay = update4_encode(msg + 19, (int)sizeof(msg) - 19, &u, is_ibgp);
@@ -447,6 +455,15 @@ int bgp_rx_process(bgp_peer_t* p){
             /* IPv4 unicast */
             if(p->caps.mp_ipv4u || u.nlri_count > 0 || u.withdrawn_count > 0){
               core_on_update4(p->core, p, &u);
+            }
+
+            /* IPv6 unicast (AFI=2, SAFI=1) */
+            if(p->caps.mp_ipv6u){
+              bgp_update6_t u6;
+              update6_init(&u6);
+              if(update6_decode(&u6, msg, (int)msglen, is_ebgp) == 0){
+                core_on_update6(p->core, p, &u6);
+              }
             }
 
             /* VPNv4 */

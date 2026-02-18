@@ -78,6 +78,94 @@ static int parse_prefix4(const char* s, struct in_addr* out, uint8_t* plen){
   return 0;
 }
 
+static int parse_prefix6(const char* s, struct in6_addr* out, int* plen){
+  // "2001:db8::/32"
+  char tmp[128];
+  memset(tmp, 0, sizeof(tmp));
+  strncpy(tmp, s, sizeof(tmp)-1);
+
+  char* slash = strchr(tmp, '/');
+  if(!slash) return -1;
+  *slash = 0;
+
+  int p = atoi(slash+1);
+  if(p < 0 || p > 128) return -1;
+
+  struct in6_addr a;
+  if(inet_pton(AF_INET6, tmp, &a) != 1) return -1;
+
+  *out = a;
+  *plen = p;
+  return 0;
+}
+
+/**
+ * Collect description text until end of line.
+ * Handles quoted strings and multiple words.
+ * Removes leading/trailing quotes if present.
+ */
+static void parse_description(parser_t* p, char* dest, size_t destlen)
+{
+  if (!dest || destlen == 0) return;
+
+  char buf[256] = {0};
+  int in_quotes = 0;
+  int pos = 0;
+
+  /* First token check: is it quoted? */
+  if (p->cur.k == TOK_WORD && p->cur.s[0] == '"') {
+    in_quotes = 1;
+    /* Skip leading quote and copy rest of token */
+    const char* src = p->cur.s + 1;
+    while (*src && *src != '"' && pos < (int)sizeof(buf) - 1) {
+      buf[pos++] = *src++;
+    }
+    /* Check if closing quote is in same token */
+    if (*src == '"') {
+      in_quotes = 0;
+      next(p);
+    } else {
+      /* Quote continues to next token(s), add space and process remaining tokens */
+      if (pos < (int)sizeof(buf) - 1) buf[pos++] = ' ';
+      next(p);
+
+      /* Collect remaining tokens until closing quote */
+      while (p->cur.k == TOK_WORD && in_quotes) {
+        const char* src = p->cur.s;
+        int found_close = 0;
+        while (*src && pos < (int)sizeof(buf) - 1) {
+          if (*src == '"') {
+            found_close = 1;
+            break;
+          }
+          buf[pos++] = *src++;
+        }
+        if (found_close) {
+          in_quotes = 0;
+          next(p);
+          break;
+        }
+        /* No closing quote yet, add space and continue */
+        if (pos < (int)sizeof(buf) - 1) buf[pos++] = ' ';
+        next(p);
+      }
+    }
+  } else if (p->cur.k == TOK_WORD) {
+    /* Unquoted single token description */
+    const char* src = p->cur.s;
+    while (*src && pos < (int)sizeof(buf) - 1) {
+      buf[pos++] = *src++;
+    }
+    next(p);
+  }
+
+  buf[pos] = '\0';
+
+  /* Copy to destination, limiting length */
+  strncpy(dest, buf, destlen - 1);
+  dest[destlen - 1] = '\0';
+}
+
 static int word_is_neighbor(const char* s){
   return (strcasecmp(s, "neighbor") == 0) || (strcasecmp(s, "neightbor") == 0);
 }
@@ -125,6 +213,7 @@ int bgp_load_config(bgp_config_t* out, const char* path){
   // defaults
   out->params.hold_time = 180;
   out->params.keepalive = 60;
+  out->default_ipv4_unicast = true;  /* enabled by default */
 
   FILE* f = fopen(path, "r");
   if(!f){
@@ -147,8 +236,7 @@ int bgp_load_config(bgp_config_t* out, const char* path){
       continue;
     }
     if(P.cur.k == TOK_BANG){
-      next(&P);
-      if(P.cur.k == TOK_EOL) next(&P);
+      skip_line(&P);
       continue;
     }
 
@@ -242,9 +330,198 @@ int bgp_load_config(bgp_config_t* out, const char* path){
       continue;
     }
 
-    /* ── ip prefix-list <name> [seq N] permit|deny <prefix> [ge N] [le N] ─ */
+    /* ── interface <name> ───────────────────────────────────────────────────
+     *   ip address <addr>/<prefix>
+     *   ipv6 address <addr>/<prefix>
+     *   description "<text>"
+     *   mtu <N>
+     *   shutdown | no shutdown
+     * ──────────────────────────────────────────────────────────────────── */
+    if(is(&P, TOK_WORD, "interface")){
+      next(&P);
+      if(P.cur.k != TOK_WORD){ skip_line(&P); continue; }
+
+      char ifname[16];
+      strncpy(ifname, P.cur.s, sizeof(ifname)-1);
+      ifname[sizeof(ifname)-1] = 0;
+      skip_line(&P);
+
+      /* Find or create interface in config */
+      interface_cfg_t* iface = NULL;
+      if(out->interface_count < 64){
+        iface = &out->interfaces[out->interface_count];
+        strncpy(iface->name, ifname, sizeof(iface->name)-1);
+        iface->name[sizeof(iface->name)-1] = 0;
+        out->interface_count++;
+      }
+
+      if(!iface){ skip_line(&P); continue; }
+
+      while(P.cur.k != TOK_EOF && P.cur.k != TOK_BANG){
+        if(P.cur.k == TOK_EOL){ next(&P); continue; }
+
+        if(is(&P, TOK_WORD, "ip")){
+          next(&P);
+          if(is(&P, TOK_WORD, "address")){
+            next(&P);
+            if(P.cur.k == TOK_WORD){
+              char addr_copy[64];
+              strncpy(addr_copy, P.cur.s, sizeof(addr_copy)-1);
+              addr_copy[sizeof(addr_copy)-1] = 0;
+              char* slash = strchr(addr_copy, '/');
+              if(slash){
+                *slash = 0;
+                int plen = atoi(slash + 1);
+                if(plen > 0 && plen <= 32){
+                  inet_aton(addr_copy, &iface->addr_v4);
+                  iface->plen_v4 = (uint8_t)plen;
+                }
+              }
+            }
+            skip_line(&P); continue;
+          }
+          skip_line(&P); continue;
+        }
+
+        if(is(&P, TOK_WORD, "ipv6")){
+          next(&P);
+          if(is(&P, TOK_WORD, "address")){
+            next(&P);
+            if(P.cur.k == TOK_WORD){
+              char addr_copy[128];
+              strncpy(addr_copy, P.cur.s, sizeof(addr_copy)-1);
+              addr_copy[sizeof(addr_copy)-1] = 0;
+              char* slash = strchr(addr_copy, '/');
+              if(slash){
+                *slash = 0;
+                int plen = atoi(slash + 1);
+                if(plen > 0 && plen <= 128){
+                  inet_pton(AF_INET6, addr_copy, &iface->addr_v6);
+                  iface->plen_v6 = (uint8_t)plen;
+                }
+              }
+            }
+            skip_line(&P); continue;
+          }
+          skip_line(&P); continue;
+        }
+
+        if(is(&P, TOK_WORD, "description")){
+          next(&P);
+          if(P.cur.k == TOK_WORD){
+            parse_description(&P, iface->description, sizeof(iface->description));
+          }
+          skip_line(&P); continue;
+        }
+
+        if(is(&P, TOK_WORD, "mtu")){
+          next(&P);
+          if(P.cur.k == TOK_WORD){
+            int mtu = atoi(P.cur.s);
+            if(mtu >= 68 && mtu <= 65535) iface->mtu = (uint32_t)mtu;
+          }
+          skip_line(&P); continue;
+        }
+
+        if(is(&P, TOK_WORD, "shutdown")){
+          iface->shutdown = 1;
+          skip_line(&P); continue;
+        }
+
+        if(is(&P, TOK_WORD, "no")){
+          next(&P);
+          if(is(&P, TOK_WORD, "shutdown")){
+            iface->shutdown = 0;
+          }
+          skip_line(&P); continue;
+        }
+
+        skip_line(&P);
+      }
+
+      next(&P); /* skip the ! */
+      continue;
+    }
+
+    /* ── ip route <prefix>/<len> { via <nexthop> | dev <ifname> } ...
+     *       ... [dev <ifname>] [via <nexthop>] [table <id>]
+     * Examples:
+     *   ip route 10.0.0.0/8 via 192.168.1.1
+     *   ip route 10.0.0.0/8 dev eth0
+     *   ip route 10.0.0.0/8 via 192.168.1.1 dev eth0
+     *   ip route 0.0.0.0/0  via 192.168.1.1 table 200
+     * ──────────────────────────────────────────────────────────────────── */
     if(is(&P, TOK_WORD, "ip")){
       next(&P);
+
+      if(is(&P, TOK_WORD, "route")){
+        next(&P);
+        if(P.cur.k != TOK_WORD){ skip_line(&P); continue; }
+
+        struct in_addr pfx = {0};
+        uint8_t plen = 0;
+        if(parse_prefix4(P.cur.s, &pfx, &plen) < 0){ skip_line(&P); continue; }
+        next(&P);
+
+        static_route_t sr;
+        memset(&sr, 0, sizeof(sr));
+        sr.prefix = pfx;
+        sr.plen   = plen;
+
+        /* Parse optional keywords: via, dev, table in any order */
+        while(P.cur.k == TOK_WORD){
+          if(is(&P, TOK_WORD, "via")){
+            next(&P);
+            if(P.cur.k == TOK_WORD){
+              parse_ipv4(P.cur.s, &sr.nexthop);
+              next(&P);
+            }
+            continue;
+          }
+          if(is(&P, TOK_WORD, "dev")){
+            next(&P);
+            if(P.cur.k == TOK_WORD){
+              strncpy(sr.ifname, P.cur.s, sizeof(sr.ifname)-1);
+              sr.ifname[sizeof(sr.ifname)-1] = 0;
+              next(&P);
+            }
+            continue;
+          }
+          if(is(&P, TOK_WORD, "table")){
+            next(&P);
+            if(P.cur.k == TOK_WORD){
+              sr.table = atoi(P.cur.s);
+              next(&P);
+            }
+            continue;
+          }
+          /* Positional nexthop (legacy: ip route <pfx> <nexthop>) */
+          if(sr.nexthop.s_addr == 0 && sr.ifname[0] == 0){
+            struct in_addr maybe_nh = {0};
+            if(parse_ipv4(P.cur.s, &maybe_nh) == 0){
+              sr.nexthop = maybe_nh;
+              next(&P);
+              continue;
+            }
+          }
+          break;
+        }
+
+        if(sr.nexthop.s_addr == 0 && sr.ifname[0] == 0){
+          log_msg(BGP_LOG_WARN,
+                  "config line %d: ip route %s/%u: need 'via <nexthop>' or 'dev <ifname>'",
+                  P.line, inet_ntoa(pfx), plen);
+          skip_line(&P); continue;
+        }
+
+        if(out->static_route_count <
+           (int)(sizeof(out->static_routes)/sizeof(out->static_routes[0]))){
+          out->static_routes[out->static_route_count++] = sr;
+        }
+        skip_line(&P);
+        continue;
+      }
+
       if(!is(&P, TOK_WORD, "prefix-list")){ skip_line(&P); continue; }
       next(&P);
       if(P.cur.k != TOK_WORD){ skip_line(&P); continue; }
@@ -462,7 +739,13 @@ int bgp_load_config(bgp_config_t* out, const char* path){
     }
 
     if(P.in_router_bgp){
-      // bgp router-id / cluster-id
+      /* Handle comment lines (! at beginning) */
+      if(P.cur.k == TOK_BANG){
+        skip_line(&P);
+        continue;
+      }
+
+      // bgp router-id / cluster-id / timers / default-ipv4-unicast
       if(is(&P, TOK_WORD, "bgp")){
         next(&P);
 
@@ -507,6 +790,26 @@ int bgp_load_config(bgp_config_t* out, const char* path){
           continue;
         }
 
+        if(is(&P, TOK_WORD, "default-ipv4-unicast")){
+          out->default_ipv4_unicast = true;
+          skip_line(&P);
+          continue;
+        }
+
+        skip_line(&P);
+        continue;
+      }
+
+      if(is(&P, TOK_WORD, "no")){
+        next(&P);
+        if(is(&P, TOK_WORD, "bgp")){
+          next(&P);
+          if(is(&P, TOK_WORD, "default-ipv4-unicast")){
+            out->default_ipv4_unicast = false;
+            skip_line(&P);
+            continue;
+          }
+        }
         skip_line(&P);
         continue;
       }
@@ -581,6 +884,42 @@ int bgp_load_config(bgp_config_t* out, const char* path){
         continue;
       }
 
+      // neighbor X activate (inside address-family context)
+      if(P.af_ctx != 0 && P.cur.k == TOK_WORD && word_is_neighbor(P.cur.s)){
+        next(&P);
+        if(P.cur.k != TOK_WORD){
+          log_msg(BGP_LOG_ERROR, "config line %d: expected neighbor IP in address-family", P.line);
+          cfg_lx_close(P.lx); fclose(f);
+          return -1;
+        }
+
+        struct in_addr nhip;
+        if(parse_ipv4(P.cur.s, &nhip) < 0){
+          log_msg(BGP_LOG_ERROR, "config line %d: bad neighbor IP in address-family", P.line);
+          cfg_lx_close(P.lx); fclose(f);
+          return -1;
+        }
+
+        bgp_neighbor_cfg_t* n = get_or_add_neighbor(out, nhip);
+        if(!n){
+          log_msg(BGP_LOG_ERROR, "config line %d: too many neighbors", P.line);
+          cfg_lx_close(P.lx); fclose(f);
+          return -1;
+        }
+
+        next(&P);
+
+        // Look for "activate" command
+        if(is(&P, TOK_WORD, "activate")){
+          set_neighbor_activate_by_af(&P, n);
+          skip_line(&P);
+          continue;
+        }
+
+        skip_line(&P);
+        continue;
+      }
+
       // neighbor ...
       if(P.cur.k == TOK_WORD && word_is_neighbor(P.cur.s)){
         next(&P);
@@ -621,8 +960,7 @@ int bgp_load_config(bgp_config_t* out, const char* path){
         if(is(&P, TOK_WORD, "description")){
           next(&P);
           if(P.cur.k == TOK_WORD){
-            strncpy(n->description, P.cur.s, sizeof(n->description)-1);
-            n->description[sizeof(n->description)-1] = 0;
+            parse_description(&P, n->description, sizeof(n->description));
           }
           skip_line(&P);
           continue;
@@ -687,23 +1025,54 @@ int bgp_load_config(bgp_config_t* out, const char* path){
       if(is(&P, TOK_WORD, "network")){
         next(&P);
         if(P.cur.k == TOK_WORD){
-          struct in_addr pfx;
-          uint8_t plen;
-          if(parse_prefix4(P.cur.s, &pfx, &plen) == 0){
-            if(out->network_count < (int)(sizeof(out->networks)/sizeof(out->networks[0]))){
-              out->networks[out->network_count].prefix = pfx;
-              out->networks[out->network_count].plen   = plen;
-              /* Record the VRF context so bgp.c can advertise as VPNv4 */
-              if(P.af_ctx == 3 && P.af_vrf_name[0]){
-                strncpy(out->networks[out->network_count].vrf_name,
-                        P.af_vrf_name,
-                        sizeof(out->networks[out->network_count].vrf_name)-1);
-                out->networks[out->network_count].vrf_name[
-                  sizeof(out->networks[out->network_count].vrf_name)-1] = 0;
-              } else {
+          if(P.af_ctx == 1){
+            // IPv4 global unicast
+            struct in_addr pfx;
+            uint8_t plen;
+            if(parse_prefix4(P.cur.s, &pfx, &plen) == 0){
+              if(out->network_count < (int)(sizeof(out->networks)/sizeof(out->networks[0]))){
+                out->networks[out->network_count].af = 1;
+                out->networks[out->network_count].plen = plen;
+                out->networks[out->network_count].prefix.addr4 = pfx;
                 out->networks[out->network_count].vrf_name[0] = 0;
+                out->network_count++;
               }
-              out->network_count++;
+            }
+          }
+          else if(P.af_ctx == 2){
+            // IPv6 global unicast
+            struct in6_addr pfx;
+            int plen;
+            if(parse_prefix6(P.cur.s, &pfx, &plen) == 0){
+              if(out->network_count < (int)(sizeof(out->networks)/sizeof(out->networks[0]))){
+                out->networks[out->network_count].af = 2;
+                out->networks[out->network_count].plen = (uint8_t)plen;
+                out->networks[out->network_count].prefix.addr6 = pfx;
+                out->networks[out->network_count].vrf_name[0] = 0;
+                out->network_count++;
+              }
+            }
+          }
+          else if(P.af_ctx == 3){
+            // VPNv4
+            struct in_addr pfx;
+            uint8_t plen;
+            if(parse_prefix4(P.cur.s, &pfx, &plen) == 0){
+              if(out->network_count < (int)(sizeof(out->networks)/sizeof(out->networks[0]))){
+                out->networks[out->network_count].af = 3;
+                out->networks[out->network_count].plen = plen;
+                out->networks[out->network_count].prefix.addr4 = pfx;
+                if(P.af_vrf_name[0]){
+                  strncpy(out->networks[out->network_count].vrf_name,
+                          P.af_vrf_name,
+                          sizeof(out->networks[out->network_count].vrf_name)-1);
+                  out->networks[out->network_count].vrf_name[
+                    sizeof(out->networks[out->network_count].vrf_name)-1] = 0;
+                } else {
+                  out->networks[out->network_count].vrf_name[0] = 0;
+                }
+                out->network_count++;
+              }
             }
           }
         }

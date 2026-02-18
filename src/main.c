@@ -3,32 +3,40 @@
 #include "bgp/cfg.h"
 #include "bgp/log.h"
 #include "bgp/dbg.h"
+#include "bgp/signals.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
 #include <unistd.h>   // getopt
+#include <signal.h>
 
 static void usage(const char* argv0){
   fprintf(stderr,
-    "Usage: %s -f <config> [-v|-vv]\n"
-    "  -f <file>   config file path\n"
-    "  -v          info logs\n"
-    "  -vv         debug logs\n",
+    "Usage: %s -f <config> [-v|-vv] [-l <listen>]\n"
+    "  -f <file>      config file path\n"
+    "  -v             info logs\n"
+    "  -vv            debug logs\n"
+    "  -l <listen>    CLI socket: unix:/path/to/socket or host:port\n"
+    "                 (default: unix:/tmp/bgpd.sock)\n",
     argv0);
 }
 
 int main(int argc, char** argv){
   const char* cfg_path = NULL;
+  const char* cli_listen = "/tmp/bgpd.sock";  // Default to UNIX socket in /tmp
   int vcount = 0;
 
   for(;;){
-    int c = getopt(argc, argv, "f:v");
+    int c = getopt(argc, argv, "f:l:v");
     if(c == -1) break;
     switch(c){
       case 'f':
         cfg_path = optarg;
+        break;
+      case 'l':
+        cli_listen = optarg;
         break;
       case 'v':
         vcount++;
@@ -57,6 +65,10 @@ int main(int argc, char** argv){
     return 1;
   }
 
+  /* Store CLI listen configuration from command-line argument */
+  strncpy(cfg.cli_listen, cli_listen, sizeof(cfg.cli_listen) - 1);
+  cfg.cli_listen[sizeof(cfg.cli_listen) - 1] = '\0';
+
   bgp_global_t* g = bgp_create();
   if(!g){
     log_msg(BGP_LOG_ERROR, "bgp_create() failed");
@@ -76,10 +88,34 @@ int main(int argc, char** argv){
     return 1;
   }
 
+  /* ── Initialize signal handling ────────────────────────────────── */
+  void* loop = bgp_get_event_loop(g);
+  if(!loop){
+    log_msg(BGP_LOG_ERROR, "bgp_get_event_loop() returned NULL");
+    bgp_destroy(g);
+    return 1;
+  }
+
+  if(bgp_signals_init(loop) < 0){
+    log_msg(BGP_LOG_WARN, "signal handling initialization failed - continuing anyway");
+  } else {
+    /* Register standard signal handlers */
+    bgp_signal_register(SIGTERM, bgp_on_sigterm, loop);
+    bgp_signal_register(SIGHUP, bgp_on_sighup, (void*)g);
+    bgp_signal_register(SIGUSR1, bgp_on_sigusr1, (void*)g);
+    bgp_signal_register(SIGUSR2, bgp_on_sigusr2, (void*)g);
+
+    log_msg(BGP_LOG_INFO, "Signal handlers registered:");
+    log_msg(BGP_LOG_INFO, "  SIGTERM  - Graceful shutdown");
+    log_msg(BGP_LOG_INFO, "  SIGHUP   - Configuration reload (framework ready)");
+    log_msg(BGP_LOG_INFO, "  SIGUSR1  - Debug dump (implemented)");
+    log_msg(BGP_LOG_INFO, "  SIGUSR2  - Stats dump (implemented)");
+  }
+
   bgp_run(g);
 
-  // If bgp_start() blocks and runs the loop, we never reach here until shutdown.
-  // If bgp_start() returns immediately, then your library needs a bgp_run() API.
+  /* ── Cleanup ────────────────────────────────────────────────────── */
+  bgp_signals_cleanup();
   bgp_destroy(g);
   return 0;
 }

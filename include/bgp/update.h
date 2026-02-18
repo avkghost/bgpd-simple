@@ -20,6 +20,9 @@ typedef struct {
   // NLRI
   bgp_prefix4_t nlri[256];
   int nlri_count;
+
+  /* RFC 4893: Whether to use 4-byte ASN encoding in AS_PATH */
+  bool as4_capable;
 } bgp_update4_t;
 
 void update4_init(bgp_update4_t* u);

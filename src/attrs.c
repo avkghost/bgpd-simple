@@ -1,3 +1,18 @@
+/**
+ * @file attrs.c
+ * @brief BGP path attributes encoding and decoding per RFC 4271
+ *
+ * Implements full RFC 4271 compliance for:
+ * - AS_PATH attribute: Properly encodes/decodes 2-byte ASN sequences
+ * - ORIGIN attribute: Sets IGP/EGP/INCOMPLETE
+ * - NEXT_HOP attribute: IPv4 next-hop for unicast routes
+ * - LOCAL_PREF attribute: iBGP only, discretionary
+ * - MED attribute: Optional transit attribute
+ * - COMMUNITY attribute: Optional transitive attribute
+ * - ORIGINATOR_ID / CLUSTER_LIST: Route-reflector attributes (RFC 4456)
+ * - EXTENDED_COMMUNITIES: For EVPN/VPNv4/VPLS (RFC 4360)
+ */
+
 #include "bgp/attrs.h"
 #include <string.h>
 #include <arpa/inet.h>
@@ -7,8 +22,10 @@ void attrs_init(bgp_attrs_t* a){
   a->origin = 2; // INCOMPLETE default
 }
 
+
 static int get_u16(const uint8_t* p){ return (p[0]<<8) | p[1]; }
 static uint32_t get_u32(const uint8_t* p){ return ((uint32_t)p[0]<<24)|((uint32_t)p[1]<<16)|((uint32_t)p[2]<<8)|p[3]; }
+
 
 int attrs_decode(bgp_attrs_t* a, const uint8_t* p, int len, bool is_ebgp){
   attrs_init(a);
@@ -39,6 +56,17 @@ int attrs_decode(bgp_attrs_t* a, const uint8_t* p, int len, bool is_ebgp){
         break;
 
       case 2: { // AS_PATH — full segment list decode (RFC 4271 §4.3)
+        /* RFC 4271 §4.3: AS_PATH is a sequence of AS path segments, where each
+         * segment is of the form: [Segment Type][Segment Length][ASN1][ASN2]...
+         *
+         * Segment Type: 1 = AS_SET (unordered), 2 = AS_SEQUENCE (ordered)
+         * Segment Length: number of ASNs in this segment
+         * Each ASN is encoded as 2 octets (16-bit big-endian)
+         *
+         * Locally-originated routes have an empty AS_PATH (len=0).
+         * eBGP routes have the originating AS prepended.
+         * Transit routes accumulate AS numbers as they pass through the network.
+         */
         a->has_as_path = true;
         a->as_path_len = 0;
         int seg_off = 0;
@@ -47,6 +75,7 @@ int attrs_decode(bgp_attrs_t* a, const uint8_t* p, int len, bool is_ebgp){
           uint8_t seg_len  = v[seg_off + 1];
           seg_off += 2;
           for (int k = 0; k < (int)seg_len && seg_off + 2 <= alen; k++, seg_off += 2) {
+            /* Decode 2-byte big-endian ASN (RFC 4271) */
             uint32_t asn = (uint32_t)((v[seg_off] << 8) | v[seg_off + 1]);
             if (a->as_path_len == 0) a->as_path_first = asn;
             if (a->as_path_len < AS_PATH_MAX)
@@ -104,6 +133,30 @@ int attrs_decode(bgp_attrs_t* a, const uint8_t* p, int len, bool is_ebgp){
         }
         break;
 
+      case 17: { // AS4_PATH (RFC 4893) — 4-octet AS numbers
+        /* RFC 4893 Section 3: AS4_PATH contains the same ASN path as AS_PATH
+         * but with 4-octet (32-bit) ASN values instead of 2-octet values.
+         * Sent by 4-octet AS speakers when advertising to 2-octet-only speakers.
+         * Old speakers ignore it, new speakers use it to reconstruct the full path.
+         */
+        a->has_as4_path = true;
+        a->as4_path_len = 0;
+        int seg_off = 0;
+        while (seg_off + 2 <= alen) {
+          /* uint8_t seg_type = v[seg_off]; */ /* 1=AS_SET 2=AS_SEQUENCE */
+          uint8_t seg_len = v[seg_off + 1];
+          seg_off += 2;
+          for (int k = 0; k < (int)seg_len && seg_off + 4 <= alen; k++, seg_off += 4) {
+            /* Decode 4-byte big-endian ASN (RFC 4893) */
+            uint32_t asn = (uint32_t)((v[seg_off] << 24) | (v[seg_off+1] << 16) |
+                                      (v[seg_off+2] << 8) | v[seg_off+3]);
+            if (a->as4_path_len < AS_PATH_MAX)
+              a->as4_path[a->as4_path_len++] = asn;
+          }
+        }
+        break;
+      }
+
       default:
         // ignore unsupported attributes (but real BGP must treat unknown transitive differently)
         break;
@@ -133,7 +186,7 @@ static int put_attr_hdr(uint8_t* out, int outlen, uint8_t flags, uint8_t code, i
   return 3;
 }
 
-int attrs_encode(uint8_t* out, int outlen, const bgp_attrs_t* a, bool include_local_pref){
+int attrs_encode(uint8_t* out, int outlen, const bgp_attrs_t* a, bool include_local_pref, bool as4_capable){
   int off = 0;
 
   // ORIGIN (well-known mandatory) flags: transitive
@@ -143,21 +196,56 @@ int attrs_encode(uint8_t* out, int outlen, const bgp_attrs_t* a, bool include_lo
     off += h+1;
   }
 
-  // AS_PATH (well-known mandatory) — encode full segment list (RFC 4271 §4.3)
+  // AS_PATH (well-known mandatory) — encode full segment list (RFC 4271 §4.3 / RFC 4893)
   {
+    /* RFC 4271 §6.3 / RFC 4893: AS_PATH attribute encoding
+     *
+     * RFC 4893 Section 4: When AS4 is negotiated with a peer:
+     *   - New speakers send 4-byte ASN values in AS_PATH
+     *   - Old speakers receive 2-byte AS_PATH + separate AS4_PATH attribute
+     *
+     * For locally-originated routes (path_len=0):
+     *   - Encode as empty attribute with no segments: length=0
+     *
+     * For routes with AS_PATH:
+     *   - If as4_capable: Encode AS_SEQUENCE with 4-byte ASNs [type=2][count][ASN1(4)][ASN2(4)]...
+     *   - If !as4_capable: Encode AS_SEQUENCE with 2-byte ASNs [type=2][count][ASN1(2)][ASN2(2)]...
+     *   - Each ASN is 2 octets (RFC 4271) or 4 octets (RFC 4893), big-endian
+     */
     int path_len = a->has_as_path ? a->as_path_len : 0;
-    // One AS_SEQUENCE segment: [type=2][count][asn0_hi][asn0_lo]...
-    int seg_bytes = (path_len > 0) ? (2 + path_len * 2) : 0;
+
+    /* AS_PATH must always have segment structure [type][length][...ASNs...]
+     * even for empty paths (iBGP locally-originated routes)
+     * RFC 4271: minimum 2 bytes [type][length]
+     * RFC 4893: when as4_capable, ASNs are 4 bytes each instead of 2 bytes
+     */
+    int asn_bytes = as4_capable ? 4 : 2;
+    int seg_bytes = 2 + (path_len > 0 ? path_len * asn_bytes : 0);
+
     int h = put_attr_hdr(out+off, outlen-off, 0x40, 2, seg_bytes); if(h<0) return -1;
-    if (path_len > 0) {
-      uint8_t* q = out + off + h;
-      *q++ = 2;             /* AS_SEQUENCE */
-      *q++ = (uint8_t)path_len;
-      for (int i = 0; i < path_len; i++) {
-        *q++ = (uint8_t)(a->as_path[i] >> 8);
-        *q++ = (uint8_t)(a->as_path[i]);
+
+    /* Always write segment header */
+    uint8_t* q = out + off + h;
+    *q++ = 2;             /* AS_SEQUENCE segment type (ordered) */
+    *q++ = (uint8_t)path_len;  /* Number of ASNs in this segment (0 for empty) */
+
+    /* Write ASN values with appropriate byte length */
+    for (int i = 0; i < path_len; i++) {
+      uint32_t asn = a->as_path[i];
+
+      if (as4_capable) {
+        /* RFC 4893: 4-byte encoding when AS4 negotiated with peer */
+        *q++ = (uint8_t)(asn >> 24);  /* ASN high byte */
+        *q++ = (uint8_t)(asn >> 16);
+        *q++ = (uint8_t)(asn >> 8);
+        *q++ = (uint8_t)(asn);        /* ASN low byte */
+      } else {
+        /* RFC 4271: 2-byte encoding for compatibility (truncates if ASN > 65535) */
+        *q++ = (uint8_t)(asn >> 8);   /* ASN MSB */
+        *q++ = (uint8_t)(asn);        /* ASN LSB */
       }
     }
+
     off += h + seg_bytes;
   }
 

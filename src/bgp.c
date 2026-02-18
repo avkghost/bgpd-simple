@@ -7,12 +7,16 @@
 #include "bgp/log.h"
 #include "bgp/msg.h"       /* peer_send_update4, peer_send_mp */
 #include "bgp/afi_ipv4u.h" /* afi_ipv4u_advertise_peer */
+#include "bgp/afi_ipv6u.h" /* afi_ipv6u_advertise_peer */
 #include "bgp/attrs.h"
 #include "bgp/cli.h"       /* cli_start */
 #include "bgp/nlri.h"      /* nlri_encode_vpnv4_one */
 #include "bgp/update6.h"   /* update6_encode_reach */
 #include "bgp/vrf.h"       /* vrf_db_t */
 #include "bgp/extcomm.h"   /* for RT encoding */
+#include "bgp/netlink.h"   /* nl_route_replace_v4, nl_route_replace_v4_dev */
+#include "bgp/rib.h"       /* rib4_add_or_replace, rib4_recompute_best */
+#include "bgp/attrs.h"     /* bgp_attrs_t, attrs_init */
 
 #include <stdlib.h>
 #include <string.h>
@@ -113,6 +117,17 @@ void bgp_destroy(bgp_global_t* g){
 /**
  * @brief Advertise globally-scoped IPv4 unicast "network" prefixes to a peer.
  */
+/**
+ * @brief Advertise locally-configured networks to a peer (RFC 4271 compliant)
+ *
+ * For locally-originated routes configured via "network" commands:
+ *   - ORIGIN: Set to IGP (internally generated)
+ *   - NEXT_HOP: Set to our local router-id
+ *   - AS_PATH: Set based on peer type (RFC 4271 §6.3)
+ *     * eBGP: AS_PATH = [local_asn] (allows AS loop detection)
+ *     * iBGP: AS_PATH = empty (no prepending in same-AS routes)
+ *   - LOCAL_PREF: Set for iBGP only (not sent to eBGP)
+ */
 static void advertise_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
 {
   if(!g || !p || !p->send_update4) return;
@@ -121,15 +136,24 @@ static void advertise_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
   bool is_ibgp = (p->local_asn == p->remote_asn_cfg);
 
   for(int i = 0; i < g->network_count; i++){
-    /* Skip VRF networks — those are advertised as VPNv4 separately. */
-    if(g->networks[i].vrf_name[0] != 0) continue;
+    /* Filter for IPv4 global unicast only (af=1) */
+    if(g->networks[i].af != 1) continue;
 
     bgp_attrs_t a;
     attrs_init(&a);
 
-    a.origin       = 0; /* IGP */
+    a.origin       = 0; /* IGP - locally generated */
     a.has_next_hop = true;
     a.next_hop     = p->local_id;
+
+    /* RFC 4271 §6.3: AS_PATH handling for locally-originated routes */
+    if(!is_ibgp && p->local_asn != 0){
+      /* eBGP peer: Prepend our ASN for loop detection (RFC 4271 §6.3) */
+      a.has_as_path = true;
+      a.as_path_len = 1;
+      a.as_path[0]  = p->local_asn;
+    }
+    /* iBGP peer: Leave AS_PATH empty (no prepending in same-AS) */
 
     if(is_ibgp){
       a.has_local_pref = true;
@@ -138,11 +162,11 @@ static void advertise_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
 
     /* Apply outbound route-map (e.g. set local-preference, MED, community) */
     if(!route_map_apply(&g->core.pol, p->rmap_out,
-                        g->networks[i].prefix, g->networks[i].plen, &a))
+                        g->networks[i].prefix.addr4, g->networks[i].plen, &a))
       continue;   /* route-map denied this prefix */
 
     (void)p->send_update4(p,
-                          &g->networks[i].prefix,
+                          &g->networks[i].prefix.addr4,
                           g->networks[i].plen,
                           &a,
                           /*withdraw=*/false);
@@ -177,13 +201,14 @@ static void advertise_vpnv4_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
 
   for(int i = 0; i < g->network_count; i++){
     const bgp_network_t* net = &g->networks[i];
-    if(net->vrf_name[0] == 0) continue;  /* global network, not VPNv4 */
+    /* Filter for VPNv4 only (af=3) */
+    if(net->af != 3) continue;
 
     /* Look up the VRF config for RD and export RTs */
     vrf_t* vrf = vrf_get(&g->vrfs, net->vrf_name, /*create=*/0);
     if(!vrf){
       log_msg(BGP_LOG_WARN, "VPNv4: VRF %s not found for network %s/%u",
-              net->vrf_name, inet_ntoa(net->prefix), net->plen);
+              net->vrf_name, inet_ntoa(net->prefix.addr4), net->plen);
       continue;
     }
     if(vrf->rd.asn == 0 && vrf->rd.val == 0){
@@ -196,7 +221,7 @@ static void advertise_vpnv4_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
     nlri_entry.label  = (vrf->rd.val >= 16) ? (vrf->rd.val & 0xFFFFF) : 100;
     nlri_entry.rd_asn = (uint16_t)vrf->rd.asn;
     nlri_entry.rd_val = vrf->rd.val;
-    nlri_entry.pfx    = net->prefix;
+    nlri_entry.pfx    = net->prefix.addr4;
     nlri_entry.plen   = net->plen;
 
     uint8_t nlri_buf[32];
@@ -208,8 +233,10 @@ static void advertise_vpnv4_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
     bgp_attrs_t a;
     attrs_init(&a);
     a.origin = 0;   /* IGP */
-    if(!is_ibgp){
+    if(!is_ibgp && p->local_asn != 0){
       a.has_as_path = true;
+      a.as_path_len = 1;
+      a.as_path[0]  = p->local_asn;
     }
     if(is_ibgp){
       a.has_local_pref = true;
@@ -239,14 +266,59 @@ static void advertise_vpnv4_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
     memcpy(nh + 8, &p->local_id, 4);    /* 4-byte IPv4 next-hop */
 
     /* Apply outbound route-map (e.g. set local-preference, MED, community) */
-    if(!route_map_apply(&g->core.pol, p->rmap_out, net->prefix, net->plen, &a))
+    if(!route_map_apply(&g->core.pol, p->rmap_out, net->prefix.addr4, net->plen, &a))
       continue;   /* route-map denied this VPNv4 prefix */
 
     log_msg(BGP_LOG_INFO, "VPNv4: advertising %s/%u in VRF %s to %s",
-            inet_ntoa(net->prefix), net->plen, vrf->name, inet_ntoa(p->addr));
+            inet_ntoa(net->prefix.addr4), net->plen, vrf->name, inet_ntoa(p->addr));
 
     (void)peer_send_mp(p, 1, 128, &a, nh, 12,
                        nlri_buf, (uint16_t)nlri_len, /*withdraw=*/false);
+  }
+}
+
+/**
+ * @brief Advertise IPv6 unicast network statements from config.
+ *
+ * For each `network` statement under `address-family ipv6 unicast`,
+ * advertise as IPv6 UPDATE message with MP_REACH_NLRI (AFI=2, SAFI=1).
+ */
+static void advertise_ipv6_networks_to_peer(bgp_global_t* g, bgp_peer_t* p)
+{
+  if(!g || !p || !p->send_update6) return;
+  if(!p->af_ipv6u_active) return;
+
+  bool is_ibgp = (p->local_asn == p->remote_asn_cfg);
+
+  for(int i = 0; i < g->network_count; i++){
+    /* Filter for IPv6 global unicast only (af=2) */
+    if(g->networks[i].af != 2) continue;
+
+    bgp_attrs_t a;
+    attrs_init(&a);
+
+    a.origin       = 0; /* IGP */
+    a.has_next_hop = true;
+    /* For IPv6, we would use IPv6 next-hop here, but for now use IPv4 */
+    a.next_hop     = p->local_id;
+
+    /* For eBGP, set AS_PATH to local ASN; for iBGP, leave empty */
+    if(!is_ibgp && p->local_asn != 0){
+      a.has_as_path = true;
+      a.as_path_len = 1;
+      a.as_path[0]  = p->local_asn;
+    }
+
+    if(is_ibgp){
+      a.has_local_pref = true;
+      a.local_pref     = 100;
+    }
+
+    /* Apply outbound route-map if any */
+    /* Note: route_map_apply_v6() not yet called here; future enhancement */
+
+    /* Send IPv6 UPDATE with correct function signature */
+    (void)p->send_update6(p, &g->networks[i].prefix.addr6, g->networks[i].plen, &a, /*withdraw=*/false);
   }
 }
 
@@ -266,11 +338,8 @@ static void advertise_ipv6_to_peer(bgp_global_t* g, bgp_peer_t* p)
 {
   if(!g || !p) return;
   if(!p->af_ipv6u_active || !p->caps.mp_ipv6u) return;
-  /* Placeholder: IPv6 unicast network statements are not yet in the config
-   * parser.  Log the intent and return. */
-  log_msg(BGP_LOG_INFO,
-          "IPv6 unicast: no locally-configured prefixes to advertise to %s",
-          inet_ntoa(p->addr));
+  /* Advertise the current IPv6 RIB to the peer */
+  afi_ipv6u_advertise_peer(&g->core, p);
 }
 
 int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
@@ -283,6 +352,8 @@ int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
   g->core.local_asn     = cfg->params.asn;
   g->core.rib.local_asn = cfg->params.asn;
   g->core.rib.router_id = cfg->params.router_id;
+  /* Initialize IPv6 RIB with same local ASN (router_id is IPv4 address) */
+  g->core.rib6.local_asn = cfg->params.asn;
 
   /* ── 2. Policy database ──────────────────────────────────────────── */
   /*
@@ -301,8 +372,31 @@ int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
   memcpy(g->networks, cfg->networks, (size_t)ncount * sizeof(g->networks[0]));
   g->network_count = ncount;
 
+  /* Also copy networks to core for CLI access (config serialization) */
+  if(ncount > (int)(sizeof(g->core.networks)/sizeof(g->core.networks[0])))
+    ncount = (int)(sizeof(g->core.networks)/sizeof(g->core.networks[0]));
+  /* Cast from bgp_network_t to core_network_t (they have identical layout) */
+  memcpy(g->core.networks, cfg->networks, (size_t)ncount * sizeof(g->core.networks[0]));
+  g->core.network_count = ncount;
+
+  /* ── 3a. Network interfaces ──────────────────────────────────────── */
+  /*
+   * Copy parsed interface configuration from config file into core.
+   * Interfaces are defined globally and are used by show config and
+   * address assignment commands.
+   */
+  int icount = cfg->interface_count;
+  if(icount > (int)(sizeof(g->core.interfaces)/sizeof(g->core.interfaces[0])))
+    icount = (int)(sizeof(g->core.interfaces)/sizeof(g->core.interfaces[0]));
+  memcpy(g->core.interfaces, cfg->interfaces, (size_t)icount * sizeof(g->core.interfaces[0]));
+  g->core.interface_count = icount;
+
   /* ── 3b. VRF database (for VPNv4 RD/RT lookup) ──────────────────── */
   g->vrfs = cfg->vrfs;   /* struct copy — pointer ownership transfers */
+
+  /* ── 3b-i. Set back-references for CLI context access ──────────────── */
+  g->core.vrfs = &g->vrfs;        /* Allow CLI to access VRF DB */
+  g->core.global_ctx = (void*)g;  /* Allow CLI to access global context */
 
   /* ── 3c. Populate core vrf_inst[] from config VRFs ──────────────── */
   /*
@@ -316,6 +410,49 @@ int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
     vrf_instance_t* vi = core_get_vrf(&g->core, cv->name, /*create=*/1);
     if(vi){
       vi->cfg = *cv;  /* copy the full vrf_t config (name, RD, RTs, vni, bridge) */
+    }
+  }
+
+  /* ── 3d. Inject persistent static routes into the RIB (and kernel FIB) ─ */
+  /*
+   * Static routes configured with "ip route" are injected into the global
+   * IPv4 RIB using from=NULL as the static-route sentinel.  If the route
+   * has a gateway nexthop or interface, it is also programmed into the
+   * kernel FIB.
+   */
+  for(int i = 0; i < cfg->static_route_count; i++){
+    const static_route_t* sr = &cfg->static_routes[i];
+    int tbl = sr->table ? sr->table : 254; /* RT_TABLE_MAIN */
+
+    bgp_attrs_t a;
+    attrs_init(&a);
+    a.origin = 0;  /* IGP */
+    if(sr->nexthop.s_addr != 0){
+      a.has_next_hop = true;
+      a.next_hop     = sr->nexthop;
+    }
+    a.has_local_pref = true;
+    a.local_pref     = 1;   /* lower than BGP routes (default 100) */
+
+    /* from == NULL marks static/locally-injected route */
+    rib4_add_or_replace(&g->core.rib, NULL, sr->prefix, sr->plen, &a);
+    int ei = rib4_find_entry(&g->core.rib, sr->prefix, sr->plen);
+    if(ei >= 0) rib4_recompute_best(&g->core.rib, ei);
+
+    /* Program the kernel FIB */
+    if(sr->ifname[0]){
+      if(nl_route_replace_v4_dev(sr->prefix, sr->plen, sr->nexthop,
+                                  sr->ifname, tbl) < 0){
+        log_msg(BGP_LOG_WARN,
+                "static route %s/%u dev %s: kernel install failed",
+                inet_ntoa(sr->prefix), sr->plen, sr->ifname);
+      }
+    } else if(sr->nexthop.s_addr != 0){
+      if(nl_route_replace_v4(sr->prefix, sr->plen, sr->nexthop, tbl) < 0){
+        log_msg(BGP_LOG_WARN,
+                "static route %s/%u via %s: kernel install failed",
+                inet_ntoa(sr->prefix), sr->plen, inet_ntoa(sr->nexthop));
+      }
     }
   }
 
@@ -350,6 +487,21 @@ int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
     p->af_evpn_active  = nc->af_evpn_active;
     p->af_vpls_active  = nc->af_vpls_active;
 
+    /*
+     * Apply "bgp default-ipv4-unicast" behavior:
+     * If enabled (default) and the neighbor has no explicit AF activation in config,
+     * automatically activate IPv4 unicast for this neighbor.
+     */
+    if (cfg->default_ipv4_unicast) {
+      bool has_any_explicit_af = (nc->af_ipv4u_active || nc->af_ipv6u_active ||
+                                  nc->af_vpnv4_active || nc->af_evpn_active ||
+                                  nc->af_vpls_active);
+      if (!has_any_explicit_af) {
+        /* No explicit AF activation in config, so auto-activate IPv4 unicast */
+        p->af_ipv4u_active = true;
+      }
+    }
+
     g->peers[g->peer_count++] = p;
     core_register_peer(&g->core, p);
   }
@@ -367,7 +519,9 @@ int bgp_start(bgp_global_t* g, const bgp_config_t* cfg, bool daemonize){
   }
 
   /* ── 7. VTY CLI ──────────────────────────────────────────────────── */
-  if(cli_start(&g->core, g->loop, "/var/run/bgpd.sock") < 0){
+  /* Use CLI listen configuration from command-line or config file */
+  const char* cli_sock = cfg->cli_listen[0] ? cfg->cli_listen : "/tmp/bgpd.sock";
+  if(cli_start(&g->core, g->loop, cli_sock) < 0){
     log_msg(BGP_LOG_WARN, "bgp_start: VTY CLI start failed — continuing");
     /* Non-fatal: daemon operates normally without CLI. */
   }
@@ -388,6 +542,11 @@ int bgp_run(bgp_global_t* g){
 void bgp_stop(bgp_global_t* g){
   if(!g || !g->loop) return;
   ev_stop(g->loop);
+}
+
+void* bgp_get_event_loop(bgp_global_t* g){
+  if(!g) return NULL;
+  return (void*)g->loop;
 }
 
 /**
@@ -414,5 +573,8 @@ void bgp_on_peer_established(bgp_global_t* g, bgp_peer_t* p)
   advertise_vpnv4_networks_to_peer(g, p);
 
   /* ── IPv6 unicast ──────────────────────────────────────────────── */
-  advertise_ipv6_to_peer(g, p);
+  if(p->af_ipv6u_active){
+    advertise_ipv6_networks_to_peer(g, p);  /* locally-originated IPv6 networks */
+    advertise_ipv6_to_peer(g, p);           /* full IPv6 RIB */
+  }
 }

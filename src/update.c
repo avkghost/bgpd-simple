@@ -88,7 +88,7 @@ int update4_encode(uint8_t* out, int outlen, const bgp_update4_t* u, bool includ
 
   // attrs
   uint8_t tmp_a[2048];
-  int alen = attrs_encode(tmp_a, (int)sizeof(tmp_a), &u->attrs, include_local_pref);
+  int alen = attrs_encode(tmp_a, (int)sizeof(tmp_a), &u->attrs, include_local_pref, u->as4_capable);
   if(alen < 0) return -1;
   if(off+2+alen > outlen) return -1;
   put_u16(out+off, (uint16_t)alen); off += 2;

@@ -3,6 +3,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
 #include <net/if.h>
 #include <net/route.h>
 #include <sys/sysctl.h>
@@ -10,16 +11,113 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 
-int nl_route_replace_v4(struct in_addr pfx, uint8_t plen, struct in_addr nh, int table){
-  (void)pfx; (void)plen; (void)nh; (void)table;
-  errno = ENOSYS;
-  return -1;
+/* ── BSD routing-socket helpers ──────────────────────────────────────────── */
+
+/*
+ * Build a netmask sockaddr_in from a prefix length.
+ * The BSD kernel uses a compact form: only the significant bytes are included.
+ */
+static struct sockaddr_in
+plen_to_mask_sa(uint8_t plen)
+{
+  struct sockaddr_in sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sin_family = AF_INET;
+  if (plen == 0) {
+    sa.sin_addr.s_addr = 0;
+    sa.sin_len = (uint8_t)sizeof(sa);
+  } else {
+    sa.sin_addr.s_addr = htonl(~((1u << (32 - plen)) - 1));
+    sa.sin_len = (uint8_t)sizeof(sa);
+  }
+  return sa;
 }
 
-int nl_route_delete_v4(struct in_addr pfx, uint8_t plen, int table){
-  (void)pfx; (void)plen; (void)table;
-  errno = ENOSYS;
-  return -1;
+/*
+ * Send a RTM_ADD or RTM_DELETE message via a BSD routing socket.
+ * gateway: may be NULL for interface-only routes.
+ * ifindex: set to the output interface index (0 = not specified).
+ */
+static int
+rt_msg_send(int type, struct in_addr dst, uint8_t plen,
+            const struct in_addr* gw, unsigned ifindex)
+{
+  /* Routing socket messages are built as a concatenation of rt_msghdr
+   * followed by a series of sockaddrs indexed by RTAX_*. */
+  struct {
+    struct rt_msghdr  hdr;
+    struct sockaddr_in dst_sa;
+    struct sockaddr_in gw_sa;
+    struct sockaddr_in mask_sa;
+  } req;
+
+  memset(&req, 0, sizeof(req));
+
+  req.dst_sa.sin_family = AF_INET;
+  req.dst_sa.sin_len    = sizeof(req.dst_sa);
+  req.dst_sa.sin_addr   = dst;
+
+  req.mask_sa = plen_to_mask_sa(plen);
+
+  int addrs = RTA_DST | RTA_NETMASK;
+
+  if (gw && gw->s_addr != 0) {
+    req.gw_sa.sin_family = AF_INET;
+    req.gw_sa.sin_len    = sizeof(req.gw_sa);
+    req.gw_sa.sin_addr   = *gw;
+    addrs |= RTA_GATEWAY;
+  }
+
+  req.hdr.rtm_msglen  = (uint16_t)sizeof(req);
+  req.hdr.rtm_version = RTM_VERSION;
+  req.hdr.rtm_type    = (uint8_t)type;
+  req.hdr.rtm_addrs   = addrs;
+  req.hdr.rtm_flags   = RTF_UP | RTF_STATIC;
+  if (gw && gw->s_addr != 0)
+    req.hdr.rtm_flags |= RTF_GATEWAY;
+  req.hdr.rtm_index   = (unsigned short)ifindex;
+  req.hdr.rtm_pid     = getpid();
+  req.hdr.rtm_seq     = 1;
+  (void)ifindex; /* index set in hdr above; kernel uses it for RTF_HOST routes */
+
+  int s = socket(AF_ROUTE, SOCK_RAW, 0);
+  if (s < 0) return -1;
+
+  ssize_t n = write(s, &req, sizeof(req));
+  close(s);
+  return (n == (ssize_t)sizeof(req)) ? 0 : -1;
+}
+
+int nl_route_replace_v4(struct in_addr pfx, uint8_t plen, struct in_addr nh, int table)
+{
+  (void)table; /* BSD routing sockets don't support per-table routing easily */
+  /* Try RTM_CHANGE first; if the route doesn't exist, fall back to RTM_ADD */
+  if (rt_msg_send(RTM_CHANGE, pfx, plen, &nh, 0) < 0)
+    return rt_msg_send(RTM_ADD, pfx, plen, &nh, 0);
+  return 0;
+}
+
+int nl_route_replace_v4_dev(struct in_addr pfx, uint8_t plen,
+                             struct in_addr nh, const char* ifname, int table)
+{
+  (void)table;
+  if (!ifname || !ifname[0]) return -1;
+
+  unsigned ifindex = if_nametoindex(ifname);
+  if (ifindex == 0) { errno = ENODEV; return -1; }
+
+  const struct in_addr* gw = (nh.s_addr != 0) ? &nh : NULL;
+
+  if (rt_msg_send(RTM_CHANGE, pfx, plen, gw, ifindex) < 0)
+    return rt_msg_send(RTM_ADD, pfx, plen, gw, ifindex);
+  return 0;
+}
+
+int nl_route_delete_v4(struct in_addr pfx, uint8_t plen, int table)
+{
+  (void)table;
+  struct in_addr zero = {0};
+  return rt_msg_send(RTM_DELETE, pfx, plen, &zero, 0);
 }
 
 /*
@@ -143,4 +241,37 @@ next:
 out:
   free(buf);
   return ret;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* IPv6 ROUTE OPERATIONS — BSD/MACOS STUBS */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+int nl_route_replace_v6(struct in6_addr pfx, uint8_t plen, struct in6_addr nh, int table)
+{
+  (void)pfx; (void)plen; (void)nh; (void)table;
+  errno = ENOSYS;
+  return -1;
+}
+
+int nl_route_replace_v6_dev(struct in6_addr pfx, uint8_t plen,
+                            struct in6_addr nh, const char* ifname, int table)
+{
+  (void)pfx; (void)plen; (void)nh; (void)ifname; (void)table;
+  errno = ENOSYS;
+  return -1;
+}
+
+int nl_route_delete_v6(struct in6_addr pfx, uint8_t plen, int table)
+{
+  (void)pfx; (void)plen; (void)table;
+  errno = ENOSYS;
+  return -1;
+}
+
+int nl_route_dump_v6(sys_route6_cb_t cb, void* arg)
+{
+  (void)cb; (void)arg;
+  errno = ENOSYS;
+  return -1;
 }

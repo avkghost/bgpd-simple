@@ -11,6 +11,8 @@
 #include "bgp/vpn.h"
 #include "bgp/msg.h"
 #include "bgp/nlri.h"
+#include "bgp/rib6.h"
+#include "bgp/netlink.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -24,12 +26,14 @@
 void core_init(bgp_core_t* c){
   memset(c, 0, sizeof(*c));
   rib4_init(&c->rib);
+  rib6_init(&c->rib6, 0, (struct in6_addr){0});
   c->listen_fd = -1;
 }
 
 void core_destroy(bgp_core_t* c){
   if(!c) return;
   rib4_destroy(&c->rib);
+  rib6_destroy(&c->rib6);
   policy_destroy(&c->pol);
   for(int i = 0; i < c->vrf_inst_count; i++){
     rib4_destroy(&c->vrf_inst[i].rib4);
@@ -82,7 +86,7 @@ void core_on_peer_down(bgp_core_t* c, bgp_peer_t* p){
   log_msg(BGP_LOG_INFO, "core_on_peer_down: withdrawing all routes from %s",
           inet_ntoa(p->addr));
 
-  /* Walk the global RIB and remove every path that came from this peer */
+  /* Walk the global IPv4 RIB and remove every path that came from this peer */
   for(int i = 0; i < c->rib.entry_count; i++){
     rib_entry4_t* re = &c->rib.entries[i];
     for(int j = 0; j < re->path_count;){
@@ -95,6 +99,21 @@ void core_on_peer_down(bgp_core_t* c, bgp_peer_t* p){
       j++;
     }
     (void)rib4_recompute_best(&c->rib, i);
+  }
+
+  /* Walk the global IPv6 RIB and remove every path that came from this peer */
+  for(int i = 0; i < c->rib6.entry_count; i++){
+    rib_entry6_t* re = &c->rib6.entries[i];
+    for(int j = 0; j < re->path_count;){
+      if(re->paths[j].from == p){
+        memmove(&re->paths[j], &re->paths[j+1],
+                (size_t)(re->path_count - j - 1) * sizeof(re->paths[0]));
+        re->path_count--;
+        continue;
+      }
+      j++;
+    }
+    rib6_recompute_best(&c->rib6, i);
   }
 
   /* Also purge from per-VRF RIBs */
@@ -170,6 +189,11 @@ int core_start_listen(bgp_core_t* c, event_loop_t* loop, uint16_t port){
 void core_on_update4(bgp_core_t* c, bgp_peer_t* from, const bgp_update4_t* up){
   /* Delegate full decision process (policy, RIB, FIB, export) to decision module. */
   decision_on_update4(c, from, up);
+}
+
+void core_on_update6(bgp_core_t* c, bgp_peer_t* from, const bgp_update6_t* up){
+  /* Delegate full IPv6 decision process (policy, RIB, FIB, export) to decision module. */
+  decision_on_update6(c, from, up);
 }
 
 void core_on_evpn_update(bgp_core_t* c, bgp_peer_t* from,

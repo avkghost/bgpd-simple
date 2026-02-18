@@ -75,3 +75,7 @@ bool prefix_list_permit(const prefix_list_t* pl, struct in_addr pfx, uint8_t ple
 bool route_map_apply(const policy_db_t* db, const char* rmap_name,
                      struct in_addr pfx, uint8_t plen,
                      bgp_attrs_t* attrs /* in/out */);
+
+bool route_map_apply_v6(const policy_db_t* db, const char* rmap_name,
+                        struct in6_addr pfx, uint8_t plen,
+                        bgp_attrs_t* attrs /* in/out */);

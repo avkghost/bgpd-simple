@@ -4,7 +4,7 @@
  * @brief VTY control-plane CLI over a UNIX-domain socket.
  *
  * Provides a Cisco-like show/clear interface for the running daemon.
- * Clients connect with: nc -U /var/run/bgpd.sock
+ * Clients connect with: nc -U /tmp/bgpd.sock
  *
  * Supported commands:
  *   show bgp summary
@@ -23,7 +23,7 @@
  *
  * @param c        BGP core state (for RIB / peer inspection).
  * @param loop     Event loop to register the accept fd with.
- * @param sockpath Path for the UNIX socket (e.g. "/var/run/bgpd.sock").
+ * @param sockpath Path for the UNIX socket (e.g. "/tmp/bgpd.sock").
  * @return 0 on success, -1 on error.
  */
 int cli_start(bgp_core_t* c, event_loop_t* loop, const char* sockpath);

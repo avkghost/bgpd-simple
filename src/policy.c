@@ -165,3 +165,69 @@ bool route_map_apply(const policy_db_t* db, const char* rmap_name,
   // no entry matched => deny by default like Cisco route-map
   return false;
 }
+
+/* IPv6 variant of route_map_apply — currently skips prefix-list matching
+ * (since we don't have IPv6 prefix-lists yet) and applies attribute modifications.
+ * A future enhancement would add IPv6 prefix-list support. */
+bool route_map_apply_v6(const policy_db_t* db, const char* rmap_name,
+                        struct in6_addr pfx, uint8_t plen,
+                        bgp_attrs_t* attrs){
+  (void)pfx; (void)plen; /* suppress unused warnings for now */
+
+  if(!rmap_name || !rmap_name[0]) return true; // no map => permit
+  const route_map_t* rm = NULL;
+  for(int i=0;i<db->rmap_count;i++) if(strcmp(db->rmaps[i].name,rmap_name)==0) rm=&db->rmaps[i];
+  if(!rm) return true;
+
+  // evaluate entries by seq order as stored
+  for(int i=0;i<rm->ent_count;i++){
+    const route_map_entry_t* e = &rm->ents[i];
+
+    /* TODO: IPv6 prefix-list matching would go here.
+     * For now, match_plist is skipped for IPv6 routes. */
+    if(e->match_plist[0]) continue; // skip IPv4 prefix-list entries
+
+    /* ── apply set actions (same as IPv4) ─────────────────────────── */
+    if (e->set_local_pref) {
+      attrs->has_local_pref = true;
+      attrs->local_pref = e->local_pref;
+    }
+    if (e->set_med) {
+      attrs->has_med = true;
+      attrs->med = e->med;
+    }
+    if (e->set_next_hop_self) {
+      attrs->set_next_hop_self = true;
+    }
+    if (e->set_community) {
+      if (e->community_additive && attrs->has_community) {
+        for (int ci = 0; ci < e->community_count; ci++) {
+          bool found = false;
+          for (int cj = 0; cj < attrs->community_count && !found; cj++)
+            found = (attrs->community[cj] == e->community[ci]);
+          if (!found && attrs->community_count < 32)
+            attrs->community[attrs->community_count++] = e->community[ci];
+        }
+      } else {
+        int cnt = e->community_count < 32 ? e->community_count : 32;
+        memcpy(attrs->community, e->community, (size_t)cnt * sizeof(uint32_t));
+        attrs->community_count = cnt;
+      }
+      attrs->has_community = (attrs->community_count > 0);
+    }
+    if (e->set_as_path_prepend && e->prepend_count > 0 &&
+        attrs->as_path_len + e->prepend_count <= AS_PATH_MAX) {
+      int shift = e->prepend_count;
+      memmove(&attrs->as_path[shift], attrs->as_path,
+              (size_t)attrs->as_path_len * sizeof(uint32_t));
+      for (int pi = 0; pi < shift; pi++)
+        attrs->as_path[pi] = e->prepend_asn;
+      attrs->as_path_len += shift;
+      attrs->has_as_path = true;
+    }
+    return e->permit;
+  }
+
+  // no entry matched => deny by default
+  return false;
+}

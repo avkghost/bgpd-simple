@@ -29,6 +29,7 @@ add_library(mod_infra OBJECT
 add_library(mod_platform OBJECT
   $<IF:$<PLATFORM_ID:Linux>,src/event_epoll.c,src/event_kqueue.c>
   $<IF:$<PLATFORM_ID:Linux>,src/netlink_linux.c,src/netlink_stub.c>
+  $<IF:$<PLATFORM_ID:Linux>,src/interface_linux.c,src/interface_stub.c>
   $<IF:$<PLATFORM_ID:Linux>,src/mpls_netlink_linux.c,src/mpls_stub.c>
 )
 
@@ -50,10 +51,11 @@ add_library(mod_encoding OBJECT
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Module: rib — Adj-RIB-In storage and best-path selection
+# Module: rib — Adj-RIB-In storage and best-path selection (IPv4 & IPv6)
 # ═══════════════════════════════════════════════════════════════════════════════
 add_library(mod_rib OBJECT
   src/rib.c
+  src/rib6.c
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -65,11 +67,13 @@ add_library(mod_policy OBJECT
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Module: routing — decision process, FIB programming, AFI export helpers
+# Module: routing — decision process, FIB programming, AFI export helpers (IPv4 & IPv6)
 # ═══════════════════════════════════════════════════════════════════════════════
 add_library(mod_routing OBJECT
   src/decision.c
+  src/decision6.c
   src/afi_ipv4u.c
+  src/afi_ipv6u.c
   src/core.c
   src/core_vpn.c
 )
@@ -82,6 +86,8 @@ add_library(mod_protocol OBJECT
   src/msg.c
   src/peer.c
   src/bgp.c
+  src/signals.c
+  src/debug.c
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -90,6 +96,7 @@ add_library(mod_protocol OBJECT
 add_library(mod_config OBJECT
   src/cfg_lex.c
   src/cfg_parse.c
+  src/cfg_write.c
 )
 
 # ═══════════════════════════════════════════════════════════════════════════════

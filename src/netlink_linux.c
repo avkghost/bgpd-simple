@@ -84,6 +84,44 @@ int nl_route_replace_v4(struct in_addr pfx, uint8_t plen, struct in_addr nh, int
   return nl_send_req(n);
 }
 
+int nl_route_replace_v4_dev(struct in_addr pfx, uint8_t plen,
+                             struct in_addr nh, const char* ifname, int table)
+{
+  if (!ifname || !ifname[0]) return -1;
+
+  unsigned ifindex = if_nametoindex(ifname);
+  if (ifindex == 0) {
+    errno = ENODEV;
+    return -1;
+  }
+
+  char buf[512];
+  memset(buf, 0, sizeof(buf));
+
+  struct nlmsghdr* n = (struct nlmsghdr*)buf;
+  n->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  n->nlmsg_type = RTM_NEWROUTE;
+  n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+
+  struct rtmsg* r = (struct rtmsg*)NLMSG_DATA(n);
+  r->rtm_family   = AF_INET;
+  r->rtm_table    = (uint8_t)table;
+  r->rtm_protocol = RTPROT_BOOT;
+  r->rtm_dst_len  = plen;
+  r->rtm_type     = RTN_UNICAST;
+
+  /* Scope: link-scope for interface routes, universe for gateway routes */
+  r->rtm_scope = (nh.s_addr == 0) ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+
+  addattr_l(n, (int)sizeof(buf), RTA_DST, &pfx, sizeof(pfx));
+  addattr_l(n, (int)sizeof(buf), RTA_OIF, &ifindex, sizeof(ifindex));
+
+  if (nh.s_addr != 0)
+    addattr_l(n, (int)sizeof(buf), RTA_GATEWAY, &nh, sizeof(nh));
+
+  return nl_send_req(n);
+}
+
 int nl_route_delete_v4(struct in_addr pfx, uint8_t plen, int table){
   char buf[512];
   memset(buf, 0, sizeof(buf));
@@ -203,6 +241,205 @@ int nl_route_dump_v4(sys_route4_cb_t cb, void* arg)
     }
   }
 done:
+  free(rxbuf);
+  close(fd);
+  return ret;
+}
+
+/* ──────────────────────────────────────────────────────────────────────────── */
+/* IPv6 ROUTE OPERATIONS */
+/* ──────────────────────────────────────────────────────────────────────────── */
+
+int nl_route_replace_v6(struct in6_addr pfx, uint8_t plen, struct in6_addr nh, int table)
+{
+  char buf[512];
+  memset(buf, 0, sizeof(buf));
+
+  struct nlmsghdr* n = (struct nlmsghdr*)buf;
+  n->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  n->nlmsg_type = RTM_NEWROUTE;
+  n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+
+  struct rtmsg* r = (struct rtmsg*)NLMSG_DATA(n);
+  r->rtm_family = AF_INET6;
+  r->rtm_table = (uint8_t)table;
+  r->rtm_protocol = RTPROT_BOOT;
+  r->rtm_scope = RT_SCOPE_UNIVERSE;
+  r->rtm_type = RTN_UNICAST;
+  r->rtm_dst_len = plen;
+
+  addattr_l(n, (int)sizeof(buf), RTA_DST, &pfx, sizeof(pfx));
+  addattr_l(n, (int)sizeof(buf), RTA_GATEWAY, &nh, sizeof(nh));
+
+  return nl_send_req(n);
+}
+
+int nl_route_replace_v6_dev(struct in6_addr pfx, uint8_t plen,
+                            struct in6_addr nh, const char* ifname, int table)
+{
+  if (!ifname || !ifname[0]) return -1;
+
+  unsigned ifindex = if_nametoindex(ifname);
+  if (ifindex == 0) {
+    errno = ENODEV;
+    return -1;
+  }
+
+  char buf[512];
+  memset(buf, 0, sizeof(buf));
+
+  struct nlmsghdr* n = (struct nlmsghdr*)buf;
+  n->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  n->nlmsg_type = RTM_NEWROUTE;
+  n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK | NLM_F_CREATE | NLM_F_REPLACE;
+
+  struct rtmsg* r = (struct rtmsg*)NLMSG_DATA(n);
+  r->rtm_family = AF_INET6;
+  r->rtm_table = (uint8_t)table;
+  r->rtm_protocol = RTPROT_BOOT;
+  r->rtm_dst_len = plen;
+  r->rtm_type = RTN_UNICAST;
+
+  /* Check if nh is all zeros (directly connected route) */
+  struct in6_addr zero_nh;
+  memset(&zero_nh, 0, sizeof(zero_nh));
+  int is_zero = memcmp(&nh, &zero_nh, sizeof(struct in6_addr)) == 0;
+
+  r->rtm_scope = is_zero ? RT_SCOPE_LINK : RT_SCOPE_UNIVERSE;
+
+  addattr_l(n, (int)sizeof(buf), RTA_DST, &pfx, sizeof(pfx));
+  addattr_l(n, (int)sizeof(buf), RTA_OIF, &ifindex, sizeof(ifindex));
+
+  if (!is_zero)
+    addattr_l(n, (int)sizeof(buf), RTA_GATEWAY, &nh, sizeof(nh));
+
+  return nl_send_req(n);
+}
+
+int nl_route_delete_v6(struct in6_addr pfx, uint8_t plen, int table)
+{
+  char buf[512];
+  memset(buf, 0, sizeof(buf));
+
+  struct nlmsghdr* n = (struct nlmsghdr*)buf;
+  n->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  n->nlmsg_type = RTM_DELROUTE;
+  n->nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
+
+  struct rtmsg* r = (struct rtmsg*)NLMSG_DATA(n);
+  r->rtm_family = AF_INET6;
+  r->rtm_table = (uint8_t)table;
+  r->rtm_protocol = RTPROT_BOOT;
+  r->rtm_scope = RT_SCOPE_UNIVERSE;
+  r->rtm_type = RTN_UNICAST;
+  r->rtm_dst_len = plen;
+
+  addattr_l(n, (int)sizeof(buf), RTA_DST, &pfx, sizeof(pfx));
+  return nl_send_req(n);
+}
+
+int nl_route_dump_v6(sys_route6_cb_t cb, void* arg)
+{
+  if (!cb) return -1;
+
+  int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+  if (fd < 0) return -1;
+
+  struct sockaddr_nl sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.nl_family = AF_NETLINK;
+  if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+    close(fd); return -1;
+  }
+
+  /* Send RTM_GETROUTE dump request for IPv6 */
+  struct {
+    struct nlmsghdr nlh;
+    struct rtmsg rtm;
+  } req;
+  memset(&req, 0, sizeof(req));
+  req.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  req.nlh.nlmsg_type = RTM_GETROUTE;
+  req.nlh.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+  req.rtm.rtm_family = AF_INET6;
+
+  struct sockaddr_nl da;
+  memset(&da, 0, sizeof(da));
+  da.nl_family = AF_NETLINK;
+
+  struct iovec iov = {&req, req.nlh.nlmsg_len};
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_name = &da;
+  msg.msg_namelen = sizeof(da);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+
+  if (sendmsg(fd, &msg, 0) < 0) {
+    close(fd); return -1;
+  }
+
+  /* Read multi-part reply */
+  char* rxbuf = malloc(65536);
+  if (!rxbuf) {
+    close(fd); return -1;
+  }
+
+  int ret = 0;
+  for (;;) {
+    ssize_t n = recv(fd, rxbuf, 65536, 0);
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ret = -1; break;
+    }
+    if (n == 0) break;
+
+    struct nlmsghdr* nlh = (struct nlmsghdr*)rxbuf;
+    for (; NLMSG_OK(nlh, (uint32_t)n); nlh = NLMSG_NEXT(nlh, n)) {
+      if (nlh->nlmsg_type == NLMSG_DONE) goto done_v6;
+      if (nlh->nlmsg_type == NLMSG_ERROR) {
+        ret = -1; goto done_v6;
+      }
+      if (nlh->nlmsg_type != RTM_NEWROUTE) continue;
+
+      struct rtmsg* rtm = (struct rtmsg*)NLMSG_DATA(nlh);
+      /* Only IPv6 unicast routes */
+      if (rtm->rtm_family != AF_INET6) continue;
+      if (rtm->rtm_type != RTN_UNICAST) continue;
+
+      sys_route6_t r;
+      memset(&r, 0, sizeof(r));
+      r.plen = rtm->rtm_dst_len;
+      r.table = rtm->rtm_table;
+      r.proto = rtm->rtm_protocol;
+
+      int rta_len = (int)(nlh->nlmsg_len - NLMSG_LENGTH(sizeof(*rtm)));
+      struct rtattr* rta = RTM_RTA(rtm);
+      for (; RTA_OK(rta, rta_len); rta = RTA_NEXT(rta, rta_len)) {
+        switch (rta->rta_type) {
+          case RTA_DST:
+            memcpy(&r.dst, RTA_DATA(rta), sizeof(struct in6_addr));
+            break;
+          case RTA_GATEWAY:
+            memcpy(&r.gw, RTA_DATA(rta), sizeof(struct in6_addr));
+            break;
+          case RTA_PRIORITY:
+            memcpy(&r.metric, RTA_DATA(rta), sizeof(r.metric));
+            break;
+          case RTA_OIF: {
+            unsigned idx;
+            memcpy(&idx, RTA_DATA(rta), sizeof(idx));
+            if_indextoname(idx, r.ifname);
+            break;
+          }
+          default: break;
+        }
+      }
+
+      if (cb(&r, arg) != 0) goto done_v6;
+    }
+  }
+done_v6:
   free(rxbuf);
   close(fd);
   return ret;

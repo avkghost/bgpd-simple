@@ -9,6 +9,7 @@
 #include "bgp/peer.h"
 #include "bgp/rib.h"
 #include "bgp/policy.h"
+#include "bgp/attrs.h"
 #include "bgp/netlink.h"
 #include "bgp/log.h"
 
@@ -160,6 +161,30 @@ void decision_on_update4(bgp_core_t* c, bgp_peer_t* from,
             if (!should_export_to(from, dst)) continue;
 
             bgp_attrs_t outa = a;
+
+            /*
+             * RFC 4271 §6.3 AS_PATH modification during route re-advertisement:
+             *
+             * RULE 1 - eBGP Peers (inter-AS):
+             *   - Prepend OUR local ASN to the AS_PATH before sending
+             *   - This allows remote AS to detect AS loops via AS_PATH
+             *   - Example: If route has AS_PATH [65001], we send [65000, 65001]
+             *   - Loop detection: Receiving peer checks if their ASN is in AS_PATH
+             *
+             * RULE 2 - iBGP Peers (intra-AS):
+             *   - MUST NOT prepend our ASN (they're in same AS)
+             *   - Leave AS_PATH unchanged for standard BGP
+             *   - Route-reflector adds ORIGINATOR_ID/CLUSTER_LIST for loop prevention
+             */
+            bool to_ebgp = (dst->local_asn != dst->remote_asn_cfg);
+            if (to_ebgp && outa.as_path_len < AS_PATH_MAX - 1) {
+                /* Shift existing AS_PATH entries right and prepend local ASN */
+                memmove(&outa.as_path[1], &outa.as_path[0],
+                        (size_t)outa.as_path_len * sizeof(outa.as_path[0]));
+                outa.as_path[0] = dst->local_asn;
+                outa.as_path_len++;
+                outa.has_as_path = true;
+            }
 
             /*
              * RFC 4456 §2.2 Route-reflector attribute injection:

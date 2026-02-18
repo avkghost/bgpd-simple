@@ -15,6 +15,11 @@ typedef struct {
   uint32_t as_path[AS_PATH_MAX]; // full ordered list (AS_SEQUENCE segments expanded)
   int      as_path_len;      // number of valid entries in as_path[]
 
+  /* RFC 4893: AS4_PATH attribute (code 17) for 4-octet ASN support */
+  bool has_as4_path;
+  uint32_t as4_path[AS_PATH_MAX]; // 4-octet ASN values from AS4_PATH attribute
+  int      as4_path_len;      // number of valid entries in as4_path[]
+
   bool has_next_hop;
   struct in_addr next_hop;
 
@@ -50,4 +55,4 @@ typedef struct {
 
 void attrs_init(bgp_attrs_t* a);
 int  attrs_decode(bgp_attrs_t* a, const uint8_t* p, int len, bool is_ebgp);
-int  attrs_encode(uint8_t* out, int outlen, const bgp_attrs_t* a, bool include_local_pref);
+int  attrs_encode(uint8_t* out, int outlen, const bgp_attrs_t* a, bool include_local_pref, bool as4_capable);
